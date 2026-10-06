@@ -35,6 +35,7 @@ local M = {}
 -- id → TestNode
 ---@type table<string, easy-dotnet.TestRunner.Node>
 M.nodes = {}
+M.nodes_version = 0
 
 ---@type easy-dotnet.TestRunner.RunnerStatus
 M.runner_status = {
@@ -75,12 +76,18 @@ function M.register(node)
 
   node.status = existing and existing.status or nil
   M.nodes[node.id] = node
+  M.nodes_version = M.nodes_version + 1
   if node.parentId == nil then M.root_id = node.id end
 end
 
 --- Remove a node from the state.
 ---@param id string
-function M.remove(id) M.nodes[id] = nil end
+function M.remove(id)
+  if M.nodes[id] then
+    M.nodes[id] = nil
+    M.nodes_version = M.nodes_version + 1
+  end
+end
 
 --- Update cached status for a node. nil status = reset to idle.
 ---@param id string
@@ -122,6 +129,7 @@ end
 
 function M.clear()
   M.nodes = {}
+  M.nodes_version = M.nodes_version + 1
   M.root_id = nil
   M.initialized = false
   M.runner_status = {

@@ -111,7 +111,7 @@ M.handler = function(client, method, params)
       if not params or not params.id then return end
       vim.schedule(function()
         local node = state.nodes[params.id]
-        state.nodes[params.id] = nil
+        state.remove(params.id)
         if node and node.filePath then buffer.apply_signs(node.filePath) end
         render.refresh()
       end)

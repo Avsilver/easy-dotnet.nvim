@@ -2,6 +2,23 @@ local M = {}
 
 M.name = "easy-dotnet"
 
+-- Neotest and the test runner can represent the same Windows path with
+-- different slash styles (and casing). Keep path comparisons independent of
+-- those representation differences.
+local function normalize_path(path)
+  if type(path) ~= "string" then return nil end
+  local normalized = vim.fn.resolve(path):gsub("\\", "/")
+  if vim.fn.has("win32") == 1 then normalized = normalized:lower() end
+  return normalized
+end
+
+local function path_is_within(path, root)
+  local normalized_path = normalize_path(path)
+  local normalized_root = normalize_path(root)
+  if not normalized_path or not normalized_root then return false end
+  return normalized_path == normalized_root or vim.startswith(normalized_path, normalized_root .. "/")
+end
+
 local function get_client() return require("easy-dotnet.rpc.rpc").global_rpc_client end
 
 local function is_initialized()
@@ -14,6 +31,9 @@ end
 -- neotest always calls is_test_file / discover_positions inside nio coroutines,
 -- so .wait() correctly yields without blocking the Neovim event loop.
 local _init_future = nil
+local _indexed_nodes = nil
+local _indexed_nodes_version = nil
+local _test_file_index = nil
 
 local function await_initialization()
   -- Switch to main loop
@@ -22,10 +42,11 @@ local function await_initialization()
   if is_initialized() then return true end
 
   if not _init_future then
-    _init_future = require("nio").control.future()
+    local future = require("nio").control.future()
+    _init_future = future
     local sln = require("easy-dotnet.current_solution").try_get_selected_solution()
     if not sln then
-      _init_future.set()
+      future.set()
     else
       local client = get_client()
       client:initialize(function()
@@ -34,13 +55,15 @@ local function await_initialization()
             local ok, state = pcall(require, "easy-dotnet.test-runner.state")
             if ok then state.initialized = true end
           end
-          _init_future.set()
+          future.set()
         end)
       end)
     end
   end
 
-  _init_future.wait()
+  local future = _init_future
+  future.wait()
+  if _init_future == future then _init_future = nil end
   return is_initialized()
 end
 
@@ -49,7 +72,9 @@ end
 function M.root(_dir)
   local sln = require("easy-dotnet.current_solution").try_get_selected_solution()
   if not sln then return nil end
-  return vim.fn.fnamemodify(sln, ":h")
+  local root = vim.fn.fnamemodify(sln, ":p:h")
+  if vim.fn.has("win32") == 1 then root = root:gsub("/", "\\") end
+  return root
 end
 
 ---@param name string
@@ -59,14 +84,19 @@ function M.filter_dir(name, _rel_path, _root) return not vim.tbl_contains({ "bin
 ---@param file_path string
 ---@return boolean
 function M.is_test_file(file_path)
-  if not vim.endswith(file_path, ".cs") then return false end
+  if not file_path:lower():match("%.cs$") then return false end
   if not await_initialization() then return false end
   local state = require("easy-dotnet.test-runner.state")
-  local norm = vim.fn.resolve(file_path)
-  for _, node in pairs(state.nodes) do
-    if node.filePath and vim.fn.resolve(node.filePath) == norm then return true end
+  if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then
+    _indexed_nodes = state.nodes
+    _indexed_nodes_version = state.nodes_version
+    _test_file_index = {}
+    for _, node in pairs(state.nodes) do
+      local path = normalize_path(node.filePath)
+      if path then _test_file_index[path] = true end
+    end
   end
-  return false
+  return _test_file_index[normalize_path(file_path)] == true
 end
 
 ---@param file_path string
@@ -121,8 +151,9 @@ function M.discover_positions(file_path)
       range = { 0, 0, 0, 0 },
     },
   }
+  local normalized_file_path = normalize_path(file_path)
   for _, pos in ipairs(positions) do
-    if pos.parentId == file_path then
+    if normalize_path(pos.parentId) == normalized_file_path then
       local child_list = build_list(pos.id)
       if child_list then table.insert(file_root, child_list) end
     end
@@ -151,11 +182,11 @@ function M.build_spec(args)
     node_id = first_child and first_child:data().id or root.id
   elseif root.type == "dir" then
     local state = require("easy-dotnet.test-runner.state")
-    local dir = vim.fn.resolve(root.id)
+    local dir = normalize_path(root.id)
 
     for _, node in pairs(state.nodes) do
       if node.type and node.type.type == "Project" and node.filePath then
-        if vim.fn.resolve(vim.fn.fnamemodify(node.filePath, ":h")) == dir then
+        if normalize_path(vim.fn.fnamemodify(node.filePath, ":h")) == dir then
           node_id = node.id
           break
         end
@@ -163,8 +194,8 @@ function M.build_spec(args)
 
       -- for typical folders neotest just assigns folder path so we need to determine
       -- proper node id that does exist on server side  based on it
-      if node.type and node.type.type == "Namespace" and node.displayName == root.name then
-        local doesChildBelongToFolder = first_child:data().path:find(root.path, 1, true) ~= nil
+      if node.type and node.type.type == "Namespace" and node.displayName == root.name and first_child then
+        local doesChildBelongToFolder = path_is_within(first_child:data().path, root.path)
         if doesChildBelongToFolder then node_id = node.id end
       end
     end
