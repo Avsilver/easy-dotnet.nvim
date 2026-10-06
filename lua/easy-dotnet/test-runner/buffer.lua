@@ -6,6 +6,7 @@ local logger = require("easy-dotnet.logger")
 local ns_signs = vim.api.nvim_create_namespace("easy_dotnet_test_signs")
 local extmark_ids = {}
 local registered_bufs = {}
+local sync_versions = {}
 
 local function neotest_integration()
   local ok, opts = pcall(require, "easy-dotnet.options")
@@ -301,6 +302,40 @@ function M.register_buf_keymaps(bufnr, client)
   end)
 end
 
+local function apply_sync_result(filepath, version, result)
+  if not result or result.version < version then return end
+
+  local live_ids = {}
+  for _, loc in ipairs(result.updates or {}) do
+    live_ids[loc.id] = true
+    state.update_line_numbers(loc)
+  end
+
+  local filepath_norm = norm(filepath)
+  state.traverse_all(function(node)
+    if norm(node.filePath) == filepath_norm and not live_ids[node.id] and not (node.type and node.type.type == "ProbableTest") then state.remove(node.id) end
+  end)
+
+  M.apply_signs(filepath)
+end
+
+--- Sync a file's current contents with the test runner before refreshing its Neotest positions.
+---@param filepath string absolute file path
+---@param content string full buffer content joined with "\n"
+---@param client easy-dotnet.RPC.Client.Dotnet
+---@param cb? fun(result: easy-dotnet.TestRunner.SyncFileResult|nil)
+---@param on_crash? fun(err: easy-dotnet.RPC.Error)
+function M.sync_file(filepath, content, client, cb, on_crash)
+  local key = norm(filepath)
+  sync_versions[key] = (sync_versions[key] or 0) + 1
+  local version = sync_versions[key]
+
+  return client.testrunner:sync_file(filepath, content, version, function(result)
+    if result and result.version >= (sync_versions[key] or version) then apply_sync_result(filepath, version, result) end
+    if cb then cb(result) end
+  end, on_crash)
+end
+
 function M.attach(filepath, client)
   if not filepath then return end
 
@@ -335,33 +370,12 @@ function M.attach(filepath, client)
       })
     end
 
-    local version = 0
-
     vim.api.nvim_create_autocmd("BufWritePost", {
       pattern = filepath,
       callback = function(ev)
-        version = version + 1
-        local v = version
-
         local lines = vim.api.nvim_buf_get_lines(ev.buf, 0, -1, false)
         local content = table.concat(lines, "\n")
-
-        client.testrunner:sync_file(filepath, content, v, function(result)
-          if not result then return end
-          if result.version < version then return end
-
-          local live_ids = {}
-          for _, loc in ipairs(result.updates or {}) do
-            live_ids[loc.id] = true
-            state.update_line_numbers(loc)
-          end
-
-          state.traverse_all(function(node)
-            if norm(node.filePath) == norm(filepath) and not live_ids[node.id] and not (node.type and node.type.type == "ProbableTest") then state.remove(node.id) end
-          end)
-
-          M.apply_signs(filepath)
-        end)
+        M.sync_file(filepath, content, client)
       end,
     })
   end

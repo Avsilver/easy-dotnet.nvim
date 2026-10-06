@@ -158,13 +158,15 @@ end
 ---@param content string full buffer content joined with "\n"
 ---@param version integer monotonically increasing per-file counter
 ---@param cb fun(result: easy-dotnet.TestRunner.SyncFileResult)
-function M:sync_file(path, content, version, cb)
+---@param on_crash? fun(err: easy-dotnet.RPC.Error)
+function M:sync_file(path, content, version, cb, on_crash)
   local helper = require("easy-dotnet.rpc.dotnet-client")
   return helper.create_rpc_call({
     client = self._client,
     method = "testrunner/syncFile",
     params = { path = path, content = content, version = version },
     cb = cb,
+    on_crash = on_crash,
   })()
 end
 

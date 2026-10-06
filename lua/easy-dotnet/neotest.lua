@@ -34,6 +34,48 @@ local _init_future = nil
 local _indexed_nodes = nil
 local _indexed_nodes_version = nil
 local _test_file_index = nil
+local _synced_buffer_ticks = {}
+
+local function sync_loaded_buffer(file_path)
+  local normalized_path = normalize_path(file_path)
+  if not normalized_path then return end
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and normalize_path(vim.api.nvim_buf_get_name(bufnr)) == normalized_path then
+      local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
+      if _synced_buffer_ticks[normalized_path] == changedtick then return end
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      local content = table.concat(lines, "\n")
+      local done = require("nio").control.future()
+      local succeeded = false
+      local finished = false
+      local function finish(success)
+        if finished then return end
+        finished = true
+        vim.schedule(function()
+          succeeded = success
+          if succeeded then _synced_buffer_ticks[normalized_path] = changedtick end
+          done.set()
+        end)
+      end
+
+      require("easy-dotnet.test-runner.buffer").sync_file(vim.api.nvim_buf_get_name(bufnr), content, get_client(), function(result) finish(result ~= nil) end, function() finish(false) end)
+      done.wait()
+      return
+    end
+  end
+end
+
+local function rebuild_test_file_index(state)
+  _indexed_nodes = state.nodes
+  _indexed_nodes_version = state.nodes_version
+  _test_file_index = {}
+  for _, node in pairs(state.nodes) do
+    local path = normalize_path(node.filePath)
+    if path then _test_file_index[path] = true end
+  end
+end
 
 local function await_initialization()
   -- Switch to main loop
@@ -87,22 +129,21 @@ function M.is_test_file(file_path)
   if not file_path:lower():match("%.cs$") then return false end
   if not await_initialization() then return false end
   local state = require("easy-dotnet.test-runner.state")
-  if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then
-    _indexed_nodes = state.nodes
-    _indexed_nodes_version = state.nodes_version
-    _test_file_index = {}
-    for _, node in pairs(state.nodes) do
-      local path = normalize_path(node.filePath)
-      if path then _test_file_index[path] = true end
-    end
+  if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then rebuild_test_file_index(state) end
+
+  local normalized_file_path = normalize_path(file_path)
+  if not _test_file_index[normalized_file_path] then
+    sync_loaded_buffer(file_path)
+    if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then rebuild_test_file_index(state) end
   end
-  return _test_file_index[normalize_path(file_path)] == true
+  return _test_file_index[normalized_file_path] == true
 end
 
 ---@param file_path string
 ---@return neotest.Tree|nil
 function M.discover_positions(file_path)
   if not await_initialization() then return nil end
+  sync_loaded_buffer(file_path)
 
   local nio = require("nio")
   local positions = nil
