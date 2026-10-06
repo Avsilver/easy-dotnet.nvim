@@ -18,10 +18,10 @@ local function to_neotest_result(detail)
   local stack_trace = {}
 
   if detail.errorMessage and #detail.errorMessage > 0 then
-    local is_from_test = detail.failingFrame and detail.failingFrame.isFromTest
-    local diagnostic_line = is_from_test and detail.failingFrame.line - 1 or nil
+    local failing_frame = detail.failingFrame
+    local diagnostic_line = failing_frame and failing_frame.isFromTest and failing_frame.line and failing_frame.line - 1 or nil
 
-    for _, item in ipairs(detail.frames) do
+    for _, item in ipairs(detail.frames or {}) do
       table.insert(stack_trace, item.originalText)
     end
 
@@ -46,7 +46,7 @@ local function to_neotest_result(detail)
   end
 
   return {
-    status = OUTCOME_MAP[detail.outcome or ""] or "failed",
+    status = OUTCOME_MAP[(detail.outcome or ""):lower()] or "failed",
     short = detail.errorMessage and detail.errorMessage[1] or nil,
     errors = errors,
     output = output_path,
@@ -71,11 +71,20 @@ return function(spec, _strategy_result, _tree)
   end)
   done.wait()
 
-  if not batch then return {} end
+  batch = batch or {}
 
   local out = {}
   for id, detail in pairs(batch) do
     out[id] = to_neotest_result(detail)
+  end
+  if spec.context.run_error then
+    for _, id in ipairs(ids) do
+      if not out[id] then out[id] = {
+        status = "failed",
+        short = spec.context.run_error,
+        errors = { { message = spec.context.run_error } },
+      } end
+    end
   end
   return out
 end

@@ -2,8 +2,8 @@
 ---@field _client easy-dotnet.RPC.StreamJsonRpc
 ---@field quick_discover fun(self: easy-dotnet.RPC.Client.TestRunner, solution_path: string, cb?: fun(result: table)): easy-dotnet.RPC.CallHandle
 ---@field initialize fun(self: easy-dotnet.RPC.Client.TestRunner, solution_path: string, cb?: fun(result: table)): easy-dotnet.RPC.CallHandle
----@field run fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb?: fun(result: easy-dotnet.TestRunner.OperationResult), source: string): easy-dotnet.RPC.CallHandle
----@field debug fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb?: fun(result: easy-dotnet.TestRunner.OperationResult), source: string): easy-dotnet.RPC.CallHandle
+---@field run fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb?: fun(result: easy-dotnet.TestRunner.OperationResult), source: string, on_crash?: fun(err: easy-dotnet.RPC.Error)): easy-dotnet.RPC.CallHandle
+---@field debug fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb?: fun(result: easy-dotnet.TestRunner.OperationResult), source: string, on_crash?: fun(err: easy-dotnet.RPC.Error)): easy-dotnet.RPC.CallHandle
 ---@field invalidate fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb?: fun(result: easy-dotnet.TestRunner.OperationResult)): easy-dotnet.RPC.CallHandle
 ---@field cancel fun(self: easy-dotnet.RPC.Client.TestRunner): boolean
 ---@field get_results fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb: fun(result: easy-dotnet.TestRunner.Results)): easy-dotnet.RPC.CallHandle
@@ -97,27 +97,31 @@ end
 
 ---@param node_id string stable server-generated node ID
 ---@param cb? fun(result: table)
----@param source string where the run was initiated from (e.g. "testrunner"|"buffer")
-function M:run(node_id, cb, source)
+---@param source string where the run was initiated from (e.g. "testrunner"|"buffer"|"neotest")
+---@param on_crash? fun(err: easy-dotnet.RPC.Error)
+function M:run(node_id, cb, source, on_crash)
   local helper = require("easy-dotnet.rpc.dotnet-client")
   return helper.create_rpc_call({
     client = self._client,
     method = "testrunner/run",
     params = { id = node_id, source = source },
     cb = cb,
+    on_crash = on_crash,
   })()
 end
 
 ---@param node_id string
 ---@param cb? fun(result: table)
----@param source string where the debug was initiated from (e.g. "testrunner"|"buffer")
-function M:debug(node_id, cb, source)
+---@param source string where the debug was initiated from (e.g. "testrunner"|"buffer"|"neotest")
+---@param on_crash? fun(err: easy-dotnet.RPC.Error)
+function M:debug(node_id, cb, source, on_crash)
   local helper = require("easy-dotnet.rpc.dotnet-client")
   return helper.create_rpc_call({
     client = self._client,
     method = "testrunner/debug",
     params = { id = node_id, source = source },
     cb = cb,
+    on_crash = on_crash,
   })()
 end
 
