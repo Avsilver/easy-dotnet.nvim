@@ -21,29 +21,31 @@ end
 
 local function get_client() return require("easy-dotnet.rpc.rpc").global_rpc_client end
 
-local function is_initialized()
-  local ok, state = pcall(require, "easy-dotnet.test-runner.state")
-  return ok and state.initialized == true
+local function get_neotest_subprocess()
+  local ok, subprocess = pcall(require, "neotest.lib.subprocess")
+  if not ok or not subprocess.enabled() then return nil end
+  return subprocess
 end
 
--- Shared future: first caller triggers init, all concurrent callers suspend on the
--- same future and resume together once the server finishes initialization.
--- neotest always calls is_test_file / discover_positions inside nio coroutines,
--- so .wait() correctly yields without blocking the Neovim event loop.
-local _init_future = nil
+-- Neotest only needs the RPC connection here. Full test-runner initialization
+-- builds/restores every project and must not gate per-file source sync.
+local _client_future = nil
+local _client_future_success = false
 local _indexed_nodes = nil
 local _indexed_nodes_version = nil
 local _test_file_index = nil
 local _synced_buffer_ticks = {}
+local _synced_disk_contents = {}
+local _discovered_contents = {}
 
 local function sync_loaded_buffer(file_path)
   local normalized_path = normalize_path(file_path)
-  if not normalized_path then return end
+  if not normalized_path then return false end
 
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(bufnr) and normalize_path(vim.api.nvim_buf_get_name(bufnr)) == normalized_path then
       local changedtick = vim.api.nvim_buf_get_changedtick(bufnr)
-      if _synced_buffer_ticks[normalized_path] == changedtick then return end
+      if _synced_buffer_ticks[normalized_path] == changedtick then return true end
 
       local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
       local content = table.concat(lines, "\n")
@@ -62,9 +64,58 @@ local function sync_loaded_buffer(file_path)
 
       require("easy-dotnet.test-runner.buffer").sync_file(vim.api.nvim_buf_get_name(bufnr), content, get_client(), function(result) finish(result ~= nil) end, function() finish(false) end)
       done.wait()
-      return
+      return true
     end
   end
+
+  return false
+end
+
+local TEST_ATTRIBUTE_NAMES = { "fact", "theory", "testcase", "testcasesource", "testmethod", "test", "inlinedata", "datarow", "arguments" }
+
+local function contains_test_attribute(content)
+  local lower_content = content:lower()
+  for _, name in ipairs(TEST_ATTRIBUTE_NAMES) do
+    local from = 1
+    while true do
+      local start = lower_content:find(name, from, true)
+      if not start then break end
+
+      local preceding = lower_content:sub(1, start - 1):reverse()
+      local open = preceding:find("%[")
+      local close = preceding:find("%]")
+      local next_char = lower_content:sub(start + #name, start + #name)
+      if open and open <= 256 and (not close or open < close) and (next_char == "" or next_char:match("[%s%],%(]")) then return true end
+      from = start + #name
+    end
+  end
+  return false
+end
+
+local function sync_unloaded_test_file(file_path)
+  local normalized_path = normalize_path(file_path)
+  if not normalized_path then return end
+
+  local ok, lines = pcall(vim.fn.readfile, file_path)
+  if not ok or not lines then return end
+  local content = table.concat(lines, "\n")
+  if not contains_test_attribute(content) or _synced_disk_contents[normalized_path] == content then return end
+
+  local done = require("nio").control.future()
+  local succeeded = false
+  local finished = false
+  local function finish(success)
+    if finished then return end
+    finished = true
+    vim.schedule(function()
+      succeeded = success
+      if succeeded then _synced_disk_contents[normalized_path] = content end
+      done.set()
+    end)
+  end
+
+  require("easy-dotnet.test-runner.buffer").sync_file(file_path, content, get_client(), function(result) finish(result ~= nil) end, function() finish(false) end)
+  done.wait()
 end
 
 local function rebuild_test_file_index(state)
@@ -77,36 +128,32 @@ local function rebuild_test_file_index(state)
   end
 end
 
-local function await_initialization()
-  -- Switch to main loop
+local function await_client()
   require("nio").scheduler()
+  local client = get_client()
+  if client._initialized then return true end
 
-  if is_initialized() then return true end
-
-  if not _init_future then
+  if not _client_future then
     local future = require("nio").control.future()
-    _init_future = future
-    local sln = require("easy-dotnet.current_solution").try_get_selected_solution()
-    if not sln then
-      future.set()
-    else
-      local client = get_client()
-      client:initialize(function()
-        client.testrunner:initialize(sln, function(result)
-          if result and result.success then
-            local ok, state = pcall(require, "easy-dotnet.test-runner.state")
-            if ok then state.initialized = true end
-          end
-          future.set()
-        end)
+    _client_future = future
+    _client_future_success = false
+    local settled = false
+    local function finish(success)
+      if settled then return end
+      settled = true
+      vim.schedule(function()
+        _client_future_success = success
+        future.set()
       end)
     end
+    client:initialize(function() finish(true) end)
+    vim.defer_fn(function() finish(false) end, 15000)
   end
 
-  local future = _init_future
+  local future = _client_future
   future.wait()
-  if _init_future == future then _init_future = nil end
-  return is_initialized()
+  if _client_future == future then _client_future = nil end
+  return _client_future_success
 end
 
 ---@param _dir string
@@ -127,23 +174,59 @@ function M.filter_dir(name, _rel_path, _root) return not vim.tbl_contains({ "bin
 ---@return boolean
 function M.is_test_file(file_path)
   if not file_path:lower():match("%.cs$") then return false end
-  if not await_initialization() then return false end
+  local subprocess = get_neotest_subprocess()
+  if subprocess and subprocess.is_child() then return subprocess.call("require('easy-dotnet.neotest').is_test_file", { file_path }) end
+  if not await_client() then return false end
   local state = require("easy-dotnet.test-runner.state")
+  if not sync_loaded_buffer(file_path) then sync_unloaded_test_file(file_path) end
   if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then rebuild_test_file_index(state) end
 
   local normalized_file_path = normalize_path(file_path)
-  if not _test_file_index[normalized_file_path] then
-    sync_loaded_buffer(file_path)
-    if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then rebuild_test_file_index(state) end
-  end
+  if _indexed_nodes ~= state.nodes or _indexed_nodes_version ~= state.nodes_version then rebuild_test_file_index(state) end
   return _test_file_index[normalized_file_path] == true
+end
+
+--- Return the current buffer (or on-disk) content for a file, or nil if unavailable.
+local function file_content(file_path)
+  local normalized_path = normalize_path(file_path)
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and normalize_path(vim.api.nvim_buf_get_name(bufnr)) == normalized_path then return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") end
+  end
+
+  local ok, lines = pcall(vim.fn.readfile, file_path)
+  if ok and lines then return table.concat(lines, "\n") end
+  return nil
+end
+
+-- Source sync only registers provisional nodes; a parameterised test ([Theory]) needs a
+-- real discovery pass against the built assembly to expand into its row subcases. Ask the
+-- server to discover this file's project (no restore/build) before reading positions.
+-- Memoised by content so an unbuilt project is retried and edits trigger rediscovery.
+local function ensure_discovered(file_path)
+  local normalized_path = normalize_path(file_path)
+  if not normalized_path then return end
+
+  local content = file_content(file_path)
+  if content and _discovered_contents[normalized_path] == content then return end
+
+  local done = require("nio").control.future()
+  get_client().testrunner:discover_file(file_path, function(result)
+    if result and result.success then
+      if content then _discovered_contents[normalized_path] = content end
+    else
+      require("easy-dotnet.logger").warn(string.format("discoverFile failed for %s; parameterised rows may be missing", file_path))
+    end
+    done.set()
+  end)
+  done.wait()
 end
 
 ---@param file_path string
 ---@return neotest.Tree|nil
-function M.discover_positions(file_path)
-  if not await_initialization() then return nil end
-  sync_loaded_buffer(file_path)
+local function get_neotest_positions(file_path)
+  if not await_client() then return nil end
+  if not sync_loaded_buffer(file_path) then sync_unloaded_test_file(file_path) end
+  ensure_discovered(file_path)
 
   local nio = require("nio")
   local positions = nil
@@ -154,6 +237,24 @@ function M.discover_positions(file_path)
     done.set()
   end)
   done.wait()
+
+  return positions
+end
+
+-- Called by neotest's embedded Neovim worker through subprocess.call so all
+-- easy-dotnet RPC traffic uses the parent editor's single server connection.
+M._get_positions_for_subprocess = get_neotest_positions
+
+---@param file_path string
+---@return neotest.Tree|nil
+function M.discover_positions(file_path)
+  local subprocess = get_neotest_subprocess()
+  local positions
+  if subprocess and subprocess.is_child() then
+    positions = subprocess.call("require('easy-dotnet.neotest')._get_positions_for_subprocess", { file_path })
+  else
+    positions = get_neotest_positions(file_path)
+  end
 
   if not positions or #positions == 0 then return nil end
 
@@ -247,6 +348,7 @@ function M.build_spec(args)
     context = {
       node_id = node_id,
       result_ids = result_ids,
+      file_path = root.path,
       debug = args.strategy == "dap",
     },
     strategy = require("easy-dotnet.neotest.strategy"),

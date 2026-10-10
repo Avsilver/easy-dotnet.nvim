@@ -8,6 +8,7 @@
 ---@field cancel fun(self: easy-dotnet.RPC.Client.TestRunner): boolean
 ---@field get_results fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string, cb: fun(result: easy-dotnet.TestRunner.Results)): easy-dotnet.RPC.CallHandle
 ---@field get_build_errors fun(self: easy-dotnet.RPC.Client.TestRunner, node_id: string): easy-dotnet.RPC.CallHandle
+---@field discover_file fun(self: easy-dotnet.RPC.Client.TestRunner, path: string, cb?: fun(result: easy-dotnet.TestRunner.DiscoverFileResult)): easy-dotnet.RPC.CallHandle
 ---@field neotest_positions fun(self: easy-dotnet.RPC.Client.TestRunner, file_path: string, cb: fun(result: easy-dotnet.TestRunner.NeotestPosition[])): easy-dotnet.RPC.CallHandle
 ---@field neotest_batch_results fun(self: easy-dotnet.RPC.Client.TestRunner, ids: string[], cb: fun(result: table<string, easy-dotnet.TestRunner.NeotestBatchResult>)): easy-dotnet.RPC.CallHandle
 
@@ -41,6 +42,10 @@
 ---@class easy-dotnet.TestRunner.SyncFileResult
 ---@field updates easy-dotnet.TestRunner.LineNumberUpdate[]
 ---@field version integer
+
+---@class easy-dotnet.TestRunner.DiscoverFileResult
+---@field success boolean
+---@field discovered boolean
 
 ---@class easy-dotnet.TestRunner.LineNumberUpdate
 ---@field id string
@@ -164,9 +169,32 @@ function M:sync_file(path, content, version, cb, on_crash)
   return helper.create_rpc_call({
     client = self._client,
     method = "testrunner/syncFile",
-    params = { path = path, content = content, version = version },
+    params = {
+      path = path,
+      content = content,
+      version = version,
+      solutionPath = require("easy-dotnet.current_solution").try_get_selected_solution(),
+    },
     cb = cb,
     on_crash = on_crash,
+  })()
+end
+
+--- testrunner/discoverFile — discover the project that owns `path` against the already
+--- built assembly (no restore/build). Lets the client expand parameterised tests
+--- ([Theory]) into their row subcases on open, without running a test first.
+---@param path string absolute file path
+---@param cb? fun(result: easy-dotnet.TestRunner.DiscoverFileResult)
+function M:discover_file(path, cb)
+  local helper = require("easy-dotnet.rpc.dotnet-client")
+  return helper.create_rpc_call({
+    client = self._client,
+    method = "testrunner/discoverFile",
+    params = {
+      path = path,
+      solutionPath = require("easy-dotnet.current_solution").try_get_selected_solution(),
+    },
+    cb = cb,
   })()
 end
 
