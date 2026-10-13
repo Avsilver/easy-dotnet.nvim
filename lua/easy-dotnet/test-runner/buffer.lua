@@ -6,7 +6,10 @@ local logger = require("easy-dotnet.logger")
 local ns_signs = vim.api.nvim_create_namespace("easy_dotnet_test_signs")
 local extmark_ids = {}
 local registered_bufs = {}
+local sync_attached_bufs = {}
 local sync_versions = {}
+local sync_generations = {}
+local sync_debounce_ms = 300
 
 local function neotest_integration()
   local ok, opts = pcall(require, "easy-dotnet.options")
@@ -305,16 +308,9 @@ end
 local function apply_sync_result(filepath, version, result)
   if not result or result.version < version then return end
 
-  local live_ids = {}
   for _, loc in ipairs(result.updates or {}) do
-    live_ids[loc.id] = true
     state.update_line_numbers(loc)
   end
-
-  local filepath_norm = norm(filepath)
-  state.traverse_all(function(node)
-    if norm(node.filePath) == filepath_norm and not live_ids[node.id] and not (node.type and node.type.type == "ProbableTest") then state.remove(node.id) end
-  end)
 
   M.apply_signs(filepath)
 end
@@ -336,11 +332,92 @@ function M.sync_file(filepath, content, client, cb, on_crash)
   end, on_crash)
 end
 
+local function sync_buffer(bufnr, filepath, client)
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then return end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  M.sync_file(filepath, table.concat(lines, "\n"), client)
+end
+
+local function schedule_buffer_sync(bufnr, filepath, client, delay)
+  local key = norm(filepath)
+  sync_generations[key] = (sync_generations[key] or 0) + 1
+  local generation = sync_generations[key]
+
+  vim.defer_fn(function()
+    if sync_generations[key] ~= generation then return end
+    sync_buffer(bufnr, filepath, client)
+  end, delay)
+end
+
+local function attach_sync_buffer(bufnr, filepath, client)
+  if sync_attached_bufs[bufnr] or not filepath:lower():match("%.cs$") then return end
+  sync_attached_bufs[bufnr] = true
+
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    buffer = bufnr,
+    callback = function() schedule_buffer_sync(bufnr, filepath, client, sync_debounce_ms) end,
+  })
+
+  -- Seed the server with unsaved buffer contents when a test file is attached.
+  schedule_buffer_sync(bufnr, filepath, client, 0)
+end
+
+--- Paths with a URI scheme (diffview://, vscode://, ...) are buffer names, not
+--- filesystem paths. Passing them to vim.fn.bufadd or as an autocmd pattern
+--- produces invalid Windows paths and RPC errors from the server.
+---@param path any
+---@return boolean
+local function is_filesystem_path(path)
+  if type(path) ~= "string" or path == "" then return false end
+  return path:find("://", 1, true) == nil
+end
+
+--- Register buffer-local autocmds for a test source file.
+---
+--- Buffer-local autocmds are used instead of `pattern = filepath` because a raw
+--- Windows path used as a pattern is parsed as a glob/regex: a path segment
+--- starting with a digit (e.g. `...\900b16a0\Foo.cs`) yields `\9`, which Vim
+--- rejects with `E65: Illegal back reference`.
+---@param bufnr integer
+---@param filepath string
+---@param client easy-dotnet.RPC.Client.Dotnet
+local function register_attach_autocmds(bufnr, filepath, client)
+  if registered_bufs[filepath] then return end
+  registered_bufs[filepath] = true
+
+  vim.api.nvim_create_autocmd("BufReadPost", {
+    buffer = bufnr,
+    callback = function(ev)
+      vim.schedule(function()
+        pcall(function()
+          attach_sync_buffer(ev.buf, filepath, client)
+          if not neotest_integration() then
+            M.apply_signs(filepath)
+            if not registered_bufs[ev.buf] then
+              M.register_buf_keymaps(ev.buf, client)
+              registered_bufs[ev.buf] = true
+            end
+          end
+        end)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    buffer = bufnr,
+    callback = function(ev) schedule_buffer_sync(ev.buf, filepath, client, 0) end,
+  })
+end
+
 function M.attach(filepath, client)
-  if not filepath then return end
+  if not is_filesystem_path(filepath) then return end
 
   local bufnr = vim.fn.bufnr(filepath)
-  if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then
+  if bufnr == -1 or not vim.api.nvim_buf_is_valid(bufnr) then bufnr = vim.fn.bufadd(filepath) end
+  if bufnr == -1 or not vim.api.nvim_buf_is_valid(bufnr) then return end
+
+  if vim.api.nvim_buf_is_loaded(bufnr) then
+    attach_sync_buffer(bufnr, filepath, client)
     if not neotest_integration() then
       M.apply_signs(filepath)
       if not registered_bufs[bufnr] then
@@ -350,35 +427,7 @@ function M.attach(filepath, client)
     end
   end
 
-  if not registered_bufs[filepath] then
-    registered_bufs[filepath] = true
-
-    if not neotest_integration() then
-      vim.api.nvim_create_autocmd("BufReadPost", {
-        pattern = filepath,
-        callback = function(ev)
-          vim.schedule(function()
-            pcall(function()
-              M.apply_signs(filepath)
-              if not registered_bufs[ev.buf] then
-                M.register_buf_keymaps(ev.buf, client)
-                registered_bufs[ev.buf] = true
-              end
-            end)
-          end)
-        end,
-      })
-    end
-
-    vim.api.nvim_create_autocmd("BufWritePost", {
-      pattern = filepath,
-      callback = function(ev)
-        local lines = vim.api.nvim_buf_get_lines(ev.buf, 0, -1, false)
-        local content = table.concat(lines, "\n")
-        M.sync_file(filepath, content, client)
-      end,
-    })
-  end
+  register_attach_autocmds(bufnr, filepath, client)
 end
 
 function M.on_status_update(node)

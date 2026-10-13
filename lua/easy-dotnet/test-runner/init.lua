@@ -63,7 +63,7 @@ function M.open()
     -- Expand the current test file's project (no restore/build) so parameterised
     -- tests show their row subcases without having to run a test first.
     local path = vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf())
-    if path:lower():match("%.cs$") then client:initialize(function()
+    if path:lower():match("%.cs$") and not path:find("://", 1, true) then client:initialize(function()
       client.testrunner:discover_file(path, function() end)
     end) end
     return

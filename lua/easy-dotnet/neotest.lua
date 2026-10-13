@@ -7,6 +7,10 @@ M.name = "easy-dotnet"
 -- those representation differences.
 local function normalize_path(path)
   if type(path) ~= "string" then return nil end
+  -- URI-scheme buffer names (diffview://, vscode://, ...) are not filesystem
+  -- paths; resolve() would mangle them into invalid Windows paths (e.g.
+  -- `diffview:D:\...`) and pollute path comparisons.
+  if path:find("://", 1, true) then return nil end
   local normalized = vim.fn.resolve(path):gsub("\\", "/")
   if vim.fn.has("win32") == 1 then normalized = normalized:lower() end
   return normalized
@@ -173,6 +177,7 @@ function M.filter_dir(name, _rel_path, _root) return not vim.tbl_contains({ "bin
 ---@param file_path string
 ---@return boolean
 function M.is_test_file(file_path)
+  if type(file_path) ~= "string" or file_path:find("://", 1, true) then return false end
   if not file_path:lower():match("%.cs$") then return false end
   local subprocess = get_neotest_subprocess()
   if subprocess and subprocess.is_child() then return subprocess.call("require('easy-dotnet.neotest').is_test_file", { file_path }) end
@@ -224,6 +229,7 @@ end
 ---@param file_path string
 ---@return neotest.Tree|nil
 local function get_neotest_positions(file_path)
+  if not normalize_path(file_path) then return nil end
   if not await_client() then return nil end
   if not sync_loaded_buffer(file_path) then sync_unloaded_test_file(file_path) end
   ensure_discovered(file_path)
@@ -248,6 +254,7 @@ M._get_positions_for_subprocess = get_neotest_positions
 ---@param file_path string
 ---@return neotest.Tree|nil
 function M.discover_positions(file_path)
+  if not normalize_path(file_path) then return nil end
   local subprocess = get_neotest_subprocess()
   local positions
   if subprocess and subprocess.is_child() then

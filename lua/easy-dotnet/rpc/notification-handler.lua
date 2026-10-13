@@ -98,8 +98,12 @@ M.handler = function(client, method, params)
       local render = require("easy-dotnet.test-runner.render")
       local buffer = require("easy-dotnet.test-runner.buffer")
       if not params or not params.test then return end
+      -- Keep the in-memory registry in step with the server immediately. In
+      -- particular, syncFile can register a just-written test and answer the
+      -- following neotestPositions request in the same RPC turn; scheduling the
+      -- state update together with UI work can leave run() seeing a stale tree.
+      state.register(params.test)
       vim.schedule(function()
-        state.register(params.test)
         if params.test.filePath then buffer.attach(params.test.filePath, client) end
         render.refresh()
         require("easy-dotnet.neotest.events").emit("registerTest", params.test)
